@@ -58,6 +58,33 @@ class BatchTransferIn(BaseModel):
     transfers: list[TransferIn] = Field(
         ..., min_length=1, description="按数组顺序依次执行的转移"
     )
+    expected_versions: dict[str, int] | None = Field(
+        default=None,
+        description=(
+            "可选的乐观并发保护：容器 ID -> 客户端预期的 version。"
+            "提供时必须恰好覆盖本批全部源与目标容器（不多不少），"
+            "覆盖不符返回 422 invalid_expected_versions；"
+            "任一容器当前版本与预期不符返回 409 stale_container，整批不落库。"
+            "不提供时保持无版本校验的兼容行为。"
+        ),
+    )
+
+    @field_validator("expected_versions", mode="before")
+    @classmethod
+    def _reject_bool_versions(cls, v):
+        # 在 lax 强转（bool -> int、"0" -> 0）发生前拦截布尔值
+        if isinstance(v, dict) and any(isinstance(ver, bool) for ver in v.values()):
+            raise ValueError("expected_versions 中的版本必须是非负整数，不能为布尔值")
+        return v
+
+    @field_validator("expected_versions")
+    @classmethod
+    def _non_negative_versions(cls, v: dict[str, int] | None) -> dict[str, int] | None:
+        if v is not None:
+            bad = [cid for cid, ver in v.items() if ver < 0]
+            if bad:
+                raise ValueError(f"expected_versions 中的版本不能为负：{bad}")
+        return v
 
 
 class SourceOut(BaseModel):
@@ -68,6 +95,9 @@ class SourceOut(BaseModel):
 
 class ContainerStatusOut(BaseModel):
     container_id: str
+    version: int = Field(
+        ..., description="容器乐观并发版本：创建时为 0，每次被成功批次触碰后加 1"
+    )
     volume: DecimalStr
     sources: list[SourceOut]
     proportion_scale: int
@@ -85,6 +115,13 @@ class ContainerOut(BaseModel):
 class BatchTransferOut(BaseModel):
     applied: int
     message: str
+    versions: dict[str, int] = Field(
+        ...,
+        description=(
+            "本批每个被触碰容器提交后的 version（同批多次出现也只加 1）。"
+            "未提供 expected_versions 时同样返回。"
+        ),
+    )
 
 
 class TakenOut(BaseModel):

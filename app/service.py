@@ -5,12 +5,17 @@
 * 体积一律使用 :class:`decimal.Decimal`，数据库中以字符串存储，全程无浮点。
 * 容器状态表示为 ``{祖先初始样品ID: 绝对体积份额}``，某容器内所有份额之和
   即当前体积。转移时按源容器当时的混合比例传播 *全部* 祖先来源。
+* 每个容器持久化一个整数 ``version``（创建时为 0）。每次成功的批量转移后，
+  被本批触碰的容器 version 恰好加 1（同批中多次出现也只加 1）。批量接口可通过
+  ``expected_versions`` 做乐观并发校验：提供时必须恰好覆盖本批全部源/目标，
+  任一容器版本与预期不符则在同一写事务内拒绝（409 stale_container），整批不落库。
 * 一批转移严格“依次”发生（后面的转移能看到前面转移的结果）。
 * 任一转移失败（未知容器 / 自转移 / 源液不足 / 参数非法），整批拒绝，
   数据库状态完全不变（单个事务回滚）。
 * 预演（preview）与真实提交共享同一份校验与分摊实现（见
   :func:`_simulate_transfers`），错误码与条目序号完全一致；
-  预演只读不写，无论成功失败都不改变数据库。
+  预演只读不写（不递增 version），无论成功失败都不改变数据库，但返回中给出
+  若真实提交后各容器将变成的 version（当前 version + 1）。
 """
 from __future__ import annotations
 
@@ -22,6 +27,9 @@ from .config import VOLUME_QUANTUM, settings
 
 # 组成：source_id（祖先初始样品）-> 绝对体积份额
 State = dict[str, Decimal]
+
+# 容器 ID -> 乐观并发版本
+Versions = dict[str, int]
 
 
 class LineageError(Exception):
@@ -87,9 +95,10 @@ def apportion(total: Decimal, shares: Mapping[str, Decimal]) -> dict[str, Decima
 # --------------------------------------------------------------------------- #
 # 状态读写
 # --------------------------------------------------------------------------- #
-def _load_state(conn: sqlite3.Connection, cid: str) -> State | None:
+def _load_state(conn: sqlite3.Connection, cid: str) -> tuple[State, int] | None:
+    """读取容器状态与当前乐观版本；容器不存在返回 ``None``。"""
     row = conn.execute(
-        "SELECT 1 FROM containers WHERE id = ?", (cid,)
+        "SELECT version FROM containers WHERE id = ?", (cid,)
     ).fetchone()
     if row is None:
         return None
@@ -98,12 +107,20 @@ def _load_state(conn: sqlite3.Connection, cid: str) -> State | None:
         "SELECT source_id, amount FROM components WHERE container_id = ?", (cid,)
     ):
         state[r["source_id"]] = Decimal(r["amount"])
-    return state
+    return state, int(row["version"])
 
 
-def _persist_states(conn: sqlite3.Connection, states: Mapping[str, State]) -> None:
-    """把本批被触碰过的容器整体写回（删后重插，处在同一事务内）。"""
+def _persist_states(
+    conn: sqlite3.Connection,
+    states: Mapping[str, State],
+    versions: Mapping[str, int],
+) -> None:
+    """把本批被触碰过的容器整体写回（version 增 1、components 删后重插，同一事务内）。"""
     for cid, state in states.items():
+        conn.execute(
+            "UPDATE containers SET version = ? WHERE id = ?",
+            (versions[cid], cid),
+        )
         conn.execute("DELETE FROM components WHERE container_id = ?", (cid,))
         conn.executemany(
             "INSERT INTO components (container_id, source_id, amount) VALUES (?, ?, ?)",
@@ -186,30 +203,83 @@ def _prepare_transfers(
     return prepared
 
 
+def _validate_expected_coverage(
+    prepared: Iterable[tuple[str, str, Decimal]],
+    expected_versions: Mapping[str, int] | None,
+) -> None:
+    """校验 expected_versions（若提供）恰好覆盖本批全部源/目标容器。
+
+    覆盖规则：键集合与“本批所有 source∪destination（去重）”完全一致，
+    多一个或少一个都拒绝。该检查发生在事务开启前，属纯请求合法性错误。
+    """
+    if expected_versions is None:
+        return
+    required: set[str] = set()
+    for src, dst, _volume in prepared:
+        required.add(src)
+        required.add(dst)
+    provided = set(expected_versions)
+    if provided != required:
+        missing = sorted(required - provided)
+        extra = sorted(provided - required)
+        details: list[str] = []
+        if missing:
+            details.append(f"缺少: {missing}")
+        if extra:
+            details.append(f"多余: {extra}")
+        raise LineageError(
+            422,
+            "invalid_expected_versions",
+            "expected_versions 必须恰好覆盖本批全部源和目标容器（"
+            + "；".join(details)
+            + "），整批拒绝",
+        )
+
+
 def _simulate_transfers(
-    conn: sqlite3.Connection, prepared: list[tuple[str, str, Decimal]]
-) -> tuple[dict[str, State], list[dict[str, Decimal]]]:
+    conn: sqlite3.Connection,
+    prepared: list[tuple[str, str, Decimal]],
+    expected_versions: Mapping[str, int] | None = None,
+) -> tuple[dict[str, State], Versions, list[dict[str, Decimal]]]:
     """按数组顺序在内存中依次模拟一批转移（链式转移看到本批前序结果）。
 
     只从数据库读取、在内存状态上演算，**不写库**；返回
-    ``(被触碰容器的最终状态, 每一步从各祖先来源实际扣取的份额)``。
+    ``(被触碰容器的最终状态, 被触碰容器的当前 version, 每一步从各祖先来源实际扣取的份额)``。
     提交与预演共用本函数，校验规则、错误码与条目序号因此完全一致。
+
+    若提供 ``expected_versions``，则在事务内对每个被触碰容器读取到的当前版本做
+    乐观并发校验：任一不符即抛 409 stale_container（调用方负责回滚，整批不落库）。
     """
     touched: dict[str, State] = {}
+    versions: Versions = {}
     taken_steps: list[dict[str, Decimal]] = []
 
     for index, (src, dst, volume) in enumerate(prepared, start=1):
         # 未知容器（初始样品与空容器都在 containers 表中）
         for cid in (src, dst):
             if cid not in touched:
-                state = _load_state(conn, cid)
-                if state is None:
+                loaded = _load_state(conn, cid)
+                if loaded is None:
                     raise LineageError(
                         404,
                         "unknown_container",
                         f"第 {index} 条转移中的容器 '{cid}' 不存在，整批拒绝",
                     )
+                state, current_version = loaded
+                # 乐观并发版本校验在同一写事务内完成（预演时为只读事务，同样不写库）
+                if expected_versions is not None:
+                    expected = expected_versions[cid]
+                    if current_version != expected:
+                        raise LineageError(
+                            409,
+                            "stale_container",
+                            (
+                                f"容器 '{cid}' 版本已过期：expected_version={expected}，"
+                                f"当前 version={current_version}，整批拒绝且不落库"
+                            ),
+                        )
                 touched[cid] = state
+                versions[cid] = current_version
 
         src_state = touched[src]
         dst_state = touched[dst]
@@ -243,47 +313,65 @@ def _simulate_transfers(
                 del src_state[sid]
         taken_steps.append(taken)
 
-    return touched, taken_steps
+    return touched, versions, taken_steps
 
 
 def apply_transfers(
-    conn: sqlite3.Connection, transfers: Iterable[tuple[str, str, Decimal]]
-) -> int:
+    conn: sqlite3.Connection,
+    transfers: Iterable[tuple[str, str, Decimal]],
+    expected_versions: Mapping[str, int] | None = None,
+) -> tuple[int, Versions]:
     """依次执行一批转移，全部成功才提交，任一失败整批回滚。
 
-    返回执行的转移条数。
+    提供 ``expected_versions`` 时在同一写事务内做乐观并发校验，任一容器版本
+    不符即抛 409 stale_container 并回滚。成功后每个被触碰容器（无论在本批中
+    出现多少次）version 恰好加 1。
+
+    返回 ``(执行的转移条数, 各被触碰容器提交后的 version)``。
     """
     prepared = _prepare_transfers(transfers)
+    _validate_expected_coverage(prepared, expected_versions)
 
-    conn.execute("BEGIN")
+    # IMMEDIATE：拿到写锁后再读版本与状态，保证“校验+写入”在同一写事务内原子
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        touched, _taken = _simulate_transfers(conn, prepared)
-        _persist_states(conn, touched)
+        touched, current_versions, _taken = _simulate_transfers(
+            conn, prepared, expected_versions
+        )
+        next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
+        _persist_states(conn, touched, next_versions)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
         raise
 
-    return len(prepared)
+    return len(prepared), next_versions
 
 
 def preview_transfers(
-    conn: sqlite3.Connection, transfers: Iterable[tuple[str, str, Decimal]]
+    conn: sqlite3.Connection,
+    transfers: Iterable[tuple[str, str, Decimal]],
+    expected_versions: Mapping[str, int] | None = None,
 ) -> dict:
     """在数据库当前状态上预演一批转移，绝不写入数据库。
 
-    与 :func:`apply_transfers` 共享全部校验与最大余额分摊逻辑
-    （错误码、条目序号一致）；模拟在事务内进行，结束即回滚，
-    成功或失败数据库都完全不变。
+    与 :func:`apply_transfers` 共享全部校验、版本校验与最大余额分摊逻辑
+    （错误码、条目序号一致）；模拟在事务内进行，结束即回滚，成功或失败
+    数据库都完全不变，version 也不递增。返回的容器状态中给出若真实提交后
+    将变成的 version（当前 version + 1，每个被触碰容器只加 1 次）。
 
     返回每一步从各祖先来源实际扣取的精确份额，以及全部受影响
-    （被本批触碰的）容器在预演结束时的最终体积与来源构成。
+    （被本批触碰的）容器在预演结束时的最终体积、来源构成与预测版本。
     """
     prepared = _prepare_transfers(transfers)
+    _validate_expected_coverage(prepared, expected_versions)
 
     conn.execute("BEGIN")
     try:
-        touched, taken_steps = _simulate_transfers(conn, prepared)
+        touched, current_versions, taken_steps = _simulate_transfers(
+            conn, prepared, expected_versions
+        )
+        predicted_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
     finally:
         # 预演只读不落库：无论成功失败都回滚，数据库状态必然不变
         conn.execute("ROLLBACK")
@@ -308,7 +396,8 @@ def preview_transfers(
     return {
         "steps": steps,
         "containers": [
-            _format_container_status(cid, touched[cid]) for cid in sorted(touched)
+            _format_container_status(cid, touched[cid], predicted_versions[cid])
+            for cid in sorted(touched)
         ],
     }
 
@@ -316,7 +405,7 @@ def preview_transfers(
 # --------------------------------------------------------------------------- #
 # 查询
 # --------------------------------------------------------------------------- #
-def _format_container_status(cid: str, state: State) -> dict:
+def _format_container_status(cid: str, state: State, version: int) -> dict:
     """把内存中的容器状态格式化为查询/预演共用的输出结构。"""
     total = sum(state.values(), Decimal(0))
     q = Decimal(1).scaleb(-settings.proportion_scale)
@@ -340,6 +429,7 @@ def _format_container_status(cid: str, state: State) -> dict:
 
     return {
         "container_id": cid,
+        "version": version,
         "volume": str(total),
         "sources": sources,
         "proportion_scale": settings.proportion_scale,
@@ -347,8 +437,9 @@ def _format_container_status(cid: str, state: State) -> dict:
 
 
 def get_container_status(conn: sqlite3.Connection, cid: str) -> dict:
-    """返回容器当前体积与各祖先来源占比。"""
-    state = _load_state(conn, cid)
-    if state is None:
+    """返回容器当前乐观版本、体积与各祖先来源占比。"""
+    loaded = _load_state(conn, cid)
+    if loaded is None:
         raise LineageError(404, "unknown_container", f"容器 '{cid}' 不存在")
-    return _format_container_status(cid, state)
+    state, version = loaded
+    return _format_container_status(cid, state, version)

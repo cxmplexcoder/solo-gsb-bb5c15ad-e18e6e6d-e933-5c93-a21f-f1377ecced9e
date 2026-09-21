@@ -89,8 +89,12 @@ def batch_transfers(
     body: BatchTransferIn, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
     triples = [(t.source, t.destination, t.volume) for t in body.transfers]
-    applied = service.apply_transfers(conn, triples)
-    return {"applied": applied, "message": f"已依次提交 {applied} 条转移"}
+    applied, versions = service.apply_transfers(conn, triples, body.expected_versions)
+    return {
+        "applied": applied,
+        "message": f"已依次提交 {applied} 条转移",
+        "versions": versions,
+    }
 
 
 @app.post(
@@ -103,7 +107,7 @@ def preview_transfers(
     body: BatchTransferIn, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
     triples = [(t.source, t.destination, t.volume) for t in body.transfers]
-    return service.preview_transfers(conn, triples)
+    return service.preview_transfers(conn, triples, body.expected_versions)
 
 
 @app.get(
