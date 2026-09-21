@@ -9,9 +9,12 @@
 - 一批转移**严格依次发生**：后面的转移能看到同批中前面转移的结果。
 - 整批是一个 SQLite 事务：**源液不足、未知容器、自转移**（或任何参数错误）都会导致
   **整批拒绝、状态完全不变**。
+- 每个容器持有持久化 **version**（创建为 0，每被一批成功提交的转移触碰一次 +1）；
+  批量转移可携带 `expected_versions` 做**乐观并发控制**：版本不符返回 `409 stale_container`
+  并整批回滚。
 - 可用 `POST /transfers/preview` **预演**同一批转移：与真实提交完全相同的校验与分摊规则，
-  返回每一步的扣取明细与受影响容器的最终状态，但**绝不写入数据库**。
-- 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
+  返回每一步的扣取明细与受影响容器的最终状态（含**预测提交后的版本**），但**绝不写入数据库**。
+- 可查询任一容器的**当前体积**、各祖先初始样品的**来源占比**与当前**版本**。
 
 ---
 
@@ -66,6 +69,9 @@ docker compose down -v       # 同时删除数据卷
 - **空容器**：预先登记的空容器，可作为转移目标。
 - 每个容器的状态记录为若干条 `{祖先初始样品 ID -> 绝对体积份额}`，份额之和即当前体积。
   Decimal 在数据库中以**字符串**存储。
+- 每个容器另持有持久化 **`version`**（整数，创建为 0）：每被一批**成功提交**的转移
+  触碰一次就 +1（同一批中多次出现也只 +1），用于乐观并发控制。
+  已有数据库在启动初始化时会自动补列（已有行版本为 0），无需手工迁移。
 
 ---
 
@@ -103,11 +109,28 @@ curl -X POST http://localhost:8000/transfers/batch \
     {"source":"S1","destination":"V1","volume":"40"},
     {"source":"S2","destination":"V1","volume":"60"}
   ]}'
-# 200 -> {"applied":2,"message":"已依次提交 2 条转移"}
+# 200 -> {"applied":2,"message":"已依次提交 2 条转移","versions":{"S1":1,"S2":1,"V1":1}}
 ```
 
 转移时从源容器按其**当时**各祖先来源的混合比例取出，累加到目标容器的同名来源上，
-源容器对应份额同步扣减。
+源容器对应份额同步扣减。成功提交后，每个被触碰容器的 `version` 恰好 +1，
+并随响应的 `versions` 字段返回。
+
+**乐观并发控制（可选）**：请求可携带 `expected_versions`（容器 ID -> 期望版本，
+取值来自此前 `GET /containers/{id}` 返回的 `version`）：
+
+```bash
+curl -X POST http://localhost:8000/transfers/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"transfers":[{"source":"S1","destination":"V1","volume":"40"}],
+       "expected_versions":{"S1":0,"V1":0}}'
+```
+
+- 提供时**必须恰好覆盖本批全部源和目标容器**：缺少或多余都返回
+  `422 invalid_expected_versions`；
+- 版本校验与状态读取在**同一写事务**内完成：任一容器版本不符返回
+  `409 stale_container`，**整批不落库**；
+- 不提供 `expected_versions` 时行为与之前完全一致（不校验版本，版本仍正常递增）。
 
 **整批拒绝**的情形（HTTP 状态码与错误码）：
 
@@ -117,6 +140,8 @@ curl -X POST http://localhost:8000/transfers/batch \
 | `source` 与 `destination` 相同 | 422 | `self_transfer` |
 | 转移体积大于源容器当前体积 | 422 | `insufficient_volume` |
 | 体积为 0、为负、非有限数，或小数位超过 `DECIMAL_SCALE` | 422 | `invalid_volume` |
+| `expected_versions` 未恰好覆盖本批全部源和目标 | 422 | `invalid_expected_versions` |
+| 任一容器当前版本与 `expected_versions` 不符 | 409 | `stale_container` |
 
 错误响应形如：
 
@@ -126,17 +151,20 @@ curl -X POST http://localhost:8000/transfers/batch \
 
 ### 4. 预演批量转移（不落库）
 
-`POST /transfers/preview` 使用与批量提交**完全相同的请求结构**，在数据库当前状态上
-按数组顺序整批模拟（链式转移使用本批前序模拟结果），返回：
+`POST /transfers/preview` 使用与批量提交**完全相同的请求结构**（含可选的
+`expected_versions`），在数据库当前状态上按数组顺序整批模拟（链式转移使用本批
+前序模拟结果），返回：
 
 - `steps`：每一步的**条目序号**与从各祖先来源**实际扣取的精确份额**（`taken` 之和
   精确等于该步请求体积，同样采用最大余额法）；
 - `containers`：全部受影响容器（本批所有源 / 目标容器）在预演结束时的**最终体积与
-  来源构成**，结构与 `GET /containers/{id}` 一致。
+  来源构成**，结构与 `GET /containers/{id}` 一致；其中 `version` 为**预测提交后的
+  版本**（当前版本 +1），预演本身不递增、不写库。
 
-预演与真实提交**共用同一套校验与分摊代码**：失败时返回的 HTTP 状态码、`error.code`
-以及消息中的条目序号（“第 N 条转移”）与 `/transfers/batch` 完全一致。预演只读不写，
-**成功或失败都不会改变数据库**，可以安全地重复调用。
+预演与真实提交**共用同一套校验与分摊代码**（包括 `expected_versions` 的覆盖与版本
+校验）：失败时返回的 HTTP 状态码、`error.code` 以及消息中的条目序号（“第 N 条转移”）
+与 `/transfers/batch` 完全一致。预演只读不写，**成功或失败都不会改变数据库**，
+可以安全地重复调用。
 
 ```bash
 curl -X POST http://localhost:8000/transfers/preview \
@@ -162,19 +190,19 @@ curl -X POST http://localhost:8000/transfers/preview \
      ]}
   ],
   "containers": [
-    {"container_id": "S1", "volume": "60.000000000",
+    {"container_id": "S1", "version": 1, "volume": "60.000000000",
      "sources": [{"source_id": "S1", "amount": "60.000000000", "proportion": "1.000000"}],
      "proportion_scale": 6},
-    {"container_id": "S2", "volume": "40.000000000",
+    {"container_id": "S2", "version": 1, "volume": "40.000000000",
      "sources": [{"source_id": "S2", "amount": "40.000000000", "proportion": "1.000000"}],
      "proportion_scale": 6},
-    {"container_id": "V1", "volume": "75.000000000",
+    {"container_id": "V1", "version": 1, "volume": "75.000000000",
      "sources": [
        {"source_id": "S1", "amount": "30.000000000", "proportion": "0.400000"},
        {"source_id": "S2", "amount": "45.000000000", "proportion": "0.600000"}
      ],
      "proportion_scale": 6},
-    {"container_id": "V2", "volume": "25.000000000",
+    {"container_id": "V2", "version": 1, "volume": "25.000000000",
      "sources": [
        {"source_id": "S1", "amount": "10.000000000", "proportion": "0.400000"},
        {"source_id": "S2", "amount": "15.000000000", "proportion": "0.600000"}
@@ -187,7 +215,7 @@ curl -X POST http://localhost:8000/transfers/preview \
 上例中第 3 步从混合容器 `V1` 取 25：预演按前两步形成的 40/60 混合比分摊为
 S1 取 10、S2 取 15；调用后数据库中 S1/S2 仍为 100、V1/V2 仍为空。
 
-### 5. 查询容器当前体积与来源占比
+### 5. 查询容器当前体积、来源占比与版本
 
 ```bash
 curl http://localhost:8000/containers/V1
@@ -196,6 +224,7 @@ curl http://localhost:8000/containers/V1
 ```json
 {
   "container_id": "V1",
+  "version": 1,
   "volume": "75.000000000",
   "sources": [
     {"source_id": "S1", "amount": "30.000000000", "proportion": "0.400000"},
@@ -205,9 +234,11 @@ curl http://localhost:8000/containers/V1
 }
 ```
 
+- `version`：容器状态版本，创建为 0，每被一批成功提交的转移触碰一次 +1；
+  可作为 `expected_versions` 的取值用于乐观并发控制。
 - `amount`：该祖先来源在容器中的**绝对体积**（满足体积守恒，可跨容器累加核对）。
 - `proportion`：占容器当前体积的比例，按 `PROPORTION_SCALE` 四舍五入，仅用于展示。
-- 空容器返回 `"volume":"0"`、`"sources":[]`；未知容器返回 `404 unknown_container`。
+- 空容器返回 `"version":0`、`"volume":"0"`、`"sources":[]`；未知容器返回 `404 unknown_container`。
 
 ---
 

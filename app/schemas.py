@@ -58,6 +58,13 @@ class BatchTransferIn(BaseModel):
     transfers: list[TransferIn] = Field(
         ..., min_length=1, description="按数组顺序依次执行的转移"
     )
+    expected_versions: dict[str, int] | None = Field(
+        None,
+        description=(
+            "可选的乐观并发版本（容器 ID -> 期望版本）；提供时必须恰好覆盖"
+            "本批全部源和目标容器，任一版本不符返回 409 stale_container"
+        ),
+    )
 
 
 class SourceOut(BaseModel):
@@ -68,6 +75,9 @@ class SourceOut(BaseModel):
 
 class ContainerStatusOut(BaseModel):
     container_id: str
+    version: int = Field(
+        ..., description="容器状态版本：创建为 0，每被一批成功提交的转移触碰一次 +1"
+    )
     volume: DecimalStr
     sources: list[SourceOut]
     proportion_scale: int
@@ -85,6 +95,9 @@ class ContainerOut(BaseModel):
 class BatchTransferOut(BaseModel):
     applied: int
     message: str
+    versions: dict[str, int] = Field(
+        ..., description="本批被触碰容器提交后的新版本（每个恰好 +1）"
+    )
 
 
 class TakenOut(BaseModel):
@@ -107,5 +120,9 @@ class BatchPreviewOut(BaseModel):
         ..., description="按数组顺序逐步模拟的扣取明细"
     )
     containers: list[ContainerStatusOut] = Field(
-        ..., description="全部受影响容器在预演结束时的最终体积与来源构成"
+        ...,
+        description=(
+            "全部受影响容器在预演结束时的最终体积与来源构成；"
+            "version 为预测提交后的版本（当前 +1），预演不递增、不写库"
+        ),
     )

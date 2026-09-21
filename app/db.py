@@ -15,7 +15,9 @@ from .config import settings
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS containers (
     id      TEXT PRIMARY KEY,
-    created INTEGER NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created INTEGER NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- 乐观并发版本：创建为 0，每被一批成功提交的转移触碰一次 +1
+    version INTEGER NOT NULL DEFAULT 0
 );
 
 -- 容器中来自每个祖先初始样品的“绝对体积份额”。
@@ -52,6 +54,16 @@ def init_db() -> None:
     with connect() as conn:
         # executescript 自带事务语义；各语句均为 IF NOT EXISTS，幂等
         conn.executescript(_SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """兼容已有数据库：老库的 containers 表没有 version 列，补列（已有行默认 0）。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(containers)")}
+    if "version" not in columns:
+        conn.execute(
+            "ALTER TABLE containers ADD COLUMN version INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 @contextmanager

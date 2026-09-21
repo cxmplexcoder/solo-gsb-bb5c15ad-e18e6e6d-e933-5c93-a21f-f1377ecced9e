@@ -34,6 +34,8 @@ app = FastAPI(
         "登记带体积的初始样品后，批量提交依次发生的容器间转移；"
         "每次按源容器当时的混合比例传播全部祖先来源（Decimal 精确计算）。"
         "支持 /transfers/preview 预演：与真实提交同一套校验与分摊，但不落库。"
+        "每个容器持有持久化 version，批量转移可携带 expected_versions "
+        "做乐观并发控制（版本不符整批拒绝）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -83,14 +85,20 @@ def create_container(
     "/transfers/batch",
     response_model=BatchTransferOut,
     tags=["transfers"],
-    summary="批量提交依次发生的转移（整批原子）",
+    summary="批量提交依次发生的转移（整批原子，可带 expected_versions 乐观并发校验）",
 )
 def batch_transfers(
     body: BatchTransferIn, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
     triples = [(t.source, t.destination, t.volume) for t in body.transfers]
-    applied = service.apply_transfers(conn, triples)
-    return {"applied": applied, "message": f"已依次提交 {applied} 条转移"}
+    applied, versions = service.apply_transfers(
+        conn, triples, body.expected_versions
+    )
+    return {
+        "applied": applied,
+        "message": f"已依次提交 {applied} 条转移",
+        "versions": versions,
+    }
 
 
 @app.post(
@@ -103,7 +111,7 @@ def preview_transfers(
     body: BatchTransferIn, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
     triples = [(t.source, t.destination, t.volume) for t in body.transfers]
-    return service.preview_transfers(conn, triples)
+    return service.preview_transfers(conn, triples, body.expected_versions)
 
 
 @app.get(
